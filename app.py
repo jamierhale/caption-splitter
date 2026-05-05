@@ -116,6 +116,8 @@ def build_prompt(
     custom_rules: str,
 ) -> str:
 
+    short_first_line = max_chars - 12  # approx: target minus avg name length + space
+
     char_instructions = {
         "remove": (
             "Do not include character name labels in the output at all. "
@@ -164,6 +166,7 @@ CAPTION LINE RULES:
 - Keep subjects with their verbs where possible
 - Lines will be displayed in pairs on screen — consider how consecutive lines read together
 - For verse or poetry, treat each line break as a natural split point
+- IMPORTANT: Character names are displayed on the same line as the actor's first words. The name and first line of dialogue will be combined, so the first line of dialogue after any character name must be short enough that name + space + first line totals approximately {max_chars} characters. For example, if the name is "HAMLET:" (7 chars) and the target is {max_chars} chars, the first dialogue line should be no more than {short_first_line} characters.
 {custom_block}
 FORMATTING:
 - {dir_instruction}
@@ -205,17 +208,23 @@ def pair_into_frames(items: list[dict]) -> list[dict]:
         item = items[i]
 
         if item["type"] == "character":
-            # L1 = character name
-            # L2 = first dialogue line (if next item is not another character name)
+            # L1 = character name + their first line of dialogue on the same line
+            # L2 = second line of their dialogue (or blank)
+            name = item["text"]
+            l1 = name
             l2 = ""
-            if i + 1 < len(items) and items[i + 1]["type"] != "character":
-                l2 = items[i + 1]["text"]
-                i += 2
-            else:
+            i += 1
+
+            if i < len(items) and items[i]["type"] != "character":
+                l1 = name + " " + items[i]["text"]   # combine name and first speech
                 i += 1
+                if i < len(items) and items[i]["type"] != "character":
+                    l2 = items[i]["text"]
+                    i += 1
+
             frames.append({
                 "#":               len(frames) + 1,
-                "Line 1 (top)":    item["text"],
+                "Line 1 (top)":    l1,
                 "Line 2 (bottom)": l2,
                 "_type":           "character",
             })
