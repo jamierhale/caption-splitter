@@ -1,191 +1,43 @@
 import streamlit as st
-import spacy
-import re
+import anthropic
+import json
 import pandas as pd
 
 st.set_page_config(page_title="Caption Splitter", page_icon="🎭", layout="wide")
 
-# ── Load spaCy model (cached so it only loads once) ───────────────────────────
+# ── API key ───────────────────────────────────────────────────────────────────
 
-@st.cache_resource
-def load_nlp():
+def get_api_key():
+    """Check Streamlit secrets first, fall back to sidebar input."""
     try:
-        return spacy.load("en_core_web_sm")
-    except OSError:
-        st.error("spaCy model missing. Run: python -m spacy download en_core_web_sm")
-        st.stop()
+        return st.secrets["ANTHROPIC_API_KEY"]
+    except Exception:
+        return None
 
-# ── Text analysis helpers ─────────────────────────────────────────────────────
+secrets_key = get_api_key()
 
-def is_character_name(line: str) -> bool:
-    """
-    Detects ALL CAPS character name lines, e.g. HAMLET or OPHELIA:
-    Allows letters, digits, spaces, apostrophes, hyphens, periods.
-    """
-    name = line.strip().rstrip(":").strip()
-    if len(name) < 2 or len(name) > 40:
-        return False
-    return bool(re.match(r"^[A-Z][A-Z\d\s'\-\.]*$", name))
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 
-def strip_stage_directions(text: str) -> str:
-    """Remove parenthetical ( ) and bracketed [ ] stage directions."""
-    text = re.sub(r"\([^)]{1,300}\)", "", text)
-    text = re.sub(r"\[[^\]]{1,300}\]", "", text)
-    return text
-
-# ── Core chunking logic ───────────────────────────────────────────────────────
-
-def split_text(text: str, nlp, max_chars: int) -> list[str]:
-    """
-    Recursively split text into chunks of at most max_chars,
-    preferring semantically meaningful break points using spaCy's
-    dependency parse. Priority order:
-      1. After punctuation (, ; : — –)
-      2. Before a coordinating conjunction (and, but, or…)
-      3. Before a subordinating clause marker (because, when, while…)
-      4. At a clause or phrase boundary (advcl, relcl, prep, conj)
-      5. At any word boundary (space)
-      6. Hard cut at max_chars (last resort)
-    Within each tier, prefers the split that fills the first line
-    as completely as possible.
-    """
-    text = text.strip()
-    if not text or len(text) <= max_chars:
-        return [text] if text else []
-
-    doc = nlp(text)
-    tokens = list(doc)
-    best_score = -1
-    best_idx = -1
-
-    for i in range(1, len(tokens)):
-        token = tokens[i]
-        prev  = tokens[i - 1]
-
-        # Character position of the potential split (start of token i)
-        left = text[: token.idx].rstrip()
-        if len(left) > max_chars:
-            break
-        if not left:
-            continue
-
-        score = 0
-
-        # Tier 1 — punctuation in the previous token
-        if prev.text in (",", ";", ":", "—", "–", "-"):
-            score += 10
-
-        # Tier 2 — coordinating conjunction coming up
-        if token.dep_ == "cc" or token.text.lower() in (
-            "and", "but", "or", "nor", "yet", "so"
-        ):
-            score += 8
-
-        # Tier 3 — subordinating clause marker
-        if token.dep_ == "mark":
-            score += 7
-
-        # Tier 4 — clause / phrase boundary
-        if token.dep_ in ("advcl", "relcl", "prep", "conj"):
-            score += 5
-
-        # Length bonus: prefer splits that fill the first line
-        score += (len(left) / max_chars) * 3
-
-        if score > best_score:
-            best_score = score
-            best_idx = token.idx
-
-    # Tier 5 — fall back to last space within limit
-    if best_idx == -1:
-        best_idx = text.rfind(" ", 0, max_chars + 1)
-
-    # Tier 6 — hard cut
-    if best_idx <= 0:
-        best_idx = max_chars
-
-    left  = text[:best_idx].strip()
-    right = text[best_idx:].strip()
-
-    return ([left] if left else []) + split_text(right, nlp, max_chars)
-
-
-def process_script(
-    raw: str,
-    remove_dirs: bool,
-    char_mode: str,
-    max_chars: int,
-    nlp,
-) -> list[str]:
-    """
-    Full pipeline:
-      • Detect character-name lines → keep or remove
-      • Remove stage directions if requested
-      • Sentence-split each speech with spaCy
-      • Chunk each sentence to max_chars using split_text()
-    Returns a flat list of caption-ready strings.
-    """
-    chunks = []
-    current_para: list[str] = []
-
-    def flush_paragraph():
-        if not current_para:
-            return
-        prose = " ".join(current_para)
-        doc = nlp(prose)
-        for sent in doc.sents:
-            for chunk in split_text(sent.text.strip(), nlp, max_chars):
-                if chunk:
-                    chunks.append(chunk)
-        current_para.clear()
-
-    for raw_line in raw.splitlines():
-        line = raw_line.strip()
-
-        # Blank line = speech boundary
-        if not line:
-            flush_paragraph()
-            continue
-
-        # Remove inline stage directions first
-        if remove_dirs:
-            line = strip_stage_directions(line).strip()
-            if not line:
-                continue  # entire line was a stage direction
-
-        # Character name line?
-        if is_character_name(line):
-            flush_paragraph()
-            if char_mode == "remove":
-                continue
-            name = line.rstrip(":").strip()
-            if char_mode == "title":
-                name = name.title()
-            chunks.append(name + ":")
-            continue
-
-        current_para.append(line)
-
-    flush_paragraph()
-    return chunks
-
-# ── Streamlit UI ──────────────────────────────────────────────────────────────
-
-st.title("🎭 Caption Splitter")
-st.caption(
-    "Paste a script and get caption-ready text split by meaning — "
-    "entirely local, no data sent anywhere."
-)
-
-# Sidebar settings
 with st.sidebar:
     st.header("⚙️ Settings")
 
+    if not secrets_key:
+        api_key = st.text_input(
+            "Anthropic API key",
+            type="password",
+            placeholder="sk-ant-...",
+            help="Your key is used only for this request and is never stored.",
+        )
+    else:
+        api_key = secrets_key
+        st.success("API key loaded from secrets", icon="🔑")
+
+    st.markdown("---")
+
     max_chars = st.slider(
-        "Max characters per caption line",
+        "Target characters per line",
         min_value=20, max_value=60, value=42, step=1,
-        help="Soft target — the splitter tries to stay under this, "
-             "but won't break a word in a bad place to hit it exactly.",
+        help="Soft target — Claude will prioritise meaning over hitting this exactly.",
     )
 
     st.markdown("---")
@@ -193,7 +45,10 @@ with st.sidebar:
     remove_dirs = st.checkbox(
         "Remove stage directions",
         value=True,
-        help="Strips anything inside ( ) or [ ] from the text.",
+        help=(
+            "Claude will remove text in ( ) or [ ] and any lines that read as "
+            "performance instructions rather than speech — even if unbracketed."
+        ),
     )
 
     char_mode = st.radio(
@@ -204,19 +59,73 @@ with st.sidebar:
             "title":     "Keep — Title Case",
             "remove":    "Remove",
         }[x],
-        help="Character names are detected as ALL-CAPS lines "
-             "(with or without a trailing colon).",
     )
 
     st.markdown("---")
     st.caption(
-        "Splitting uses spaCy's dependency parser to find natural "
-        "break points — clause boundaries, conjunctions, and punctuation "
-        "are all preferred over arbitrary character counts."
+        "Splitting is done entirely by Claude — no data is sent anywhere else. "
+        "A typical script scene costs less than 1p to process."
     )
 
-# Main area
-nlp = load_nlp()
+# ── Prompt builder ────────────────────────────────────────────────────────────
+
+def build_prompt(text: str, remove_dirs: bool, char_mode: str, max_chars: int) -> str:
+    char_instructions = {
+        "remove": (
+            "Remove character name labels entirely — do not include them in the output at all."
+        ),
+        "keep_caps": (
+            "Keep character names in ALL CAPS as they appear, followed by a colon "
+            "(e.g. HAMLET:). Place each name as its own entry in the array."
+        ),
+        "title": (
+            "Convert character names to Title Case followed by a colon "
+            "(e.g. HAMLET → Hamlet:). Place each name as its own entry in the array."
+        ),
+    }
+
+    dir_instruction = (
+        "Remove all stage directions from the output. This includes text in parentheses "
+        "or square brackets, and any lines that are clearly performance instructions "
+        "rather than speech — even if they are not bracketed. Use your judgement: if a "
+        "line is clearly telling a performer what to do rather than being dialogue, remove it."
+        if remove_dirs else
+        "Keep stage directions in the output, treating them as normal text to be split."
+    )
+
+    return f"""You are an expert caption editor for live theatre and performance. \
+Take the script text below and split it into individual caption lines ready for display on screen.
+
+CAPTION LINE RULES:
+- Target approximately {max_chars} characters per line — treat this as a soft guide, not a hard limit
+- Prioritise meaning and natural speech rhythm over hitting the character count exactly
+- Never break mid-phrase or mid-thought
+- Prefer splitting in this order of priority:
+    1. After sentence-ending punctuation (. ! ?)
+    2. After a comma, semicolon, colon, or dash
+    3. Before a coordinating conjunction (and, but, or, nor, yet, so)
+    4. Before a subordinating clause (because, when, while, although, if, that, which, who)
+    5. Between natural phrases or breath points
+- Keep subjects with their verbs where possible
+- Lines will be displayed in pairs on screen — consider how consecutive lines read together
+- For verse or poetry, treat each line break as a natural split point
+
+FORMATTING:
+- {dir_instruction}
+- {char_instructions[char_mode]}
+
+OUTPUT:
+Return ONLY a raw JSON array of strings. No explanation, no markdown, no code fences — \
+just the JSON array starting with [ and ending with ]. Example:
+["To be, or not to be,", "that is the question:"]
+
+SCRIPT:
+{text}"""
+
+# ── Main UI ───────────────────────────────────────────────────────────────────
+
+st.title("🎭 Caption Splitter")
+st.caption("Paste a script and get caption-ready lines split by meaning.")
 
 script_input = st.text_area(
     "Paste your script here",
@@ -232,48 +141,91 @@ script_input = st.text_area(
     ),
 )
 
+ready = bool(api_key and script_input.strip())
+
 generate = st.button(
     "Generate Captions",
     type="primary",
-    disabled=not script_input.strip(),
+    disabled=not ready,
 )
 
-if generate and script_input.strip():
-    with st.spinner("Analysing…"):
-        all_chunks = process_script(
-            script_input, remove_dirs, char_mode, max_chars, nlp
-        )
+if not api_key:
+    st.info("Enter your Anthropic API key in the sidebar to get started.", icon="🔑")
 
-    if not all_chunks:
-        st.warning("Nothing to show after processing — try adjusting the settings.")
-    else:
-        # Pair chunks into two-line caption frames
-        frames = []
-        for i in range(0, len(all_chunks), 2):
-            frames.append({
-                "#":              i // 2 + 1,
-                "Line 1 (top)":   all_chunks[i],
-                "Line 2 (bottom)": all_chunks[i + 1] if i + 1 < len(all_chunks) else "",
-            })
+# ── Generation ────────────────────────────────────────────────────────────────
 
-        df = pd.DataFrame(frames)
+if generate and ready:
+    prompt = build_prompt(script_input, remove_dirs, char_mode, max_chars)
 
-        st.success(f"{len(frames)} caption frames generated from {len(all_chunks)} lines")
+    with st.spinner("Claude is reading your script…"):
+        try:
+            client = anthropic.Anthropic(api_key=api_key)
+            message = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=4096,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = message.content[0].text.strip()
 
-        st.dataframe(
-            df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "#":               st.column_config.NumberColumn(width=60),
-                "Line 1 (top)":    st.column_config.TextColumn(),
-                "Line 2 (bottom)": st.column_config.TextColumn(),
-            },
-        )
+            # Robust JSON extraction — strip any accidental markdown fences
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            raw = raw.strip()
 
-        st.download_button(
-            label="⬇ Download as CSV",
-            data=df.to_csv(index=False),
-            file_name="captions.csv",
-            mime="text/csv",
-        )
+            lines = json.loads(raw)
+
+            if not isinstance(lines, list):
+                raise ValueError("Response was not a JSON array.")
+
+            lines = [str(l).strip() for l in lines if str(l).strip()]
+
+        except anthropic.AuthenticationError:
+            st.error("Invalid API key — please check it in the sidebar.")
+            st.stop()
+        except anthropic.RateLimitError:
+            st.error("Rate limit hit — wait a moment and try again.")
+            st.stop()
+        except json.JSONDecodeError:
+            st.error("Couldn't parse Claude's response. Try again — this is rare.")
+            with st.expander("Raw response (for debugging)"):
+                st.text(raw)
+            st.stop()
+        except Exception as e:
+            st.error(f"Something went wrong: {e}")
+            st.stop()
+
+    # Pair lines into caption frames
+    frames = []
+    for i in range(0, len(lines), 2):
+        frames.append({
+            "#":               i // 2 + 1,
+            "Line 1 (top)":    lines[i],
+            "Line 2 (bottom)": lines[i + 1] if i + 1 < len(lines) else "",
+        })
+
+    df = pd.DataFrame(frames)
+
+    st.success(
+        f"{len(frames)} caption frames · {len(lines)} lines · "
+        f"≈{sum(len(l) for l in lines) // len(lines)} chars avg"
+    )
+
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "#":               st.column_config.NumberColumn(width=55),
+            "Line 1 (top)":    st.column_config.TextColumn(),
+            "Line 2 (bottom)": st.column_config.TextColumn(),
+        },
+    )
+
+    st.download_button(
+        label="⬇ Download as CSV",
+        data=df.to_csv(index=False),
+        file_name="captions.csv",
+        mime="text/csv",
+    )
