@@ -2,31 +2,58 @@ import streamlit as st
 import anthropic
 import json
 import pandas as pd
+import pathlib
+from supabase import create_client
 
 st.set_page_config(page_title="Caption Splitter", page_icon="🎭", layout="wide")
 
-# ── Password gate ─────────────────────────────────────────────────────────────
+# ── Persistent custom rules ───────────────────────────────────────────────────
 
-def check_password():
-    if st.session_state.get("authenticated"):
-        return True
+RULES_FILE = pathlib.Path(__file__).parent / "custom_rules.txt"
+
+DEFAULT_RULES = """\
+- Target approximately {max_chars} characters per line — treat this as a soft guide, not a hard limit
+- Prioritise meaning and natural speech rhythm over hitting the character count exactly
+- Never break mid-phrase or mid-thought
+- Prefer splitting in this order of priority:
+    1. After sentence-ending punctuation (. ! ?)
+    2. After a comma, semicolon, colon, or dash
+    3. Before a coordinating conjunction (and, but, or, nor, yet, so)
+    4. Before a subordinating clause (because, when, while, although, if, that, which, who)
+    5. Between natural phrases or breath points
+- Keep subjects with their verbs where possible
+- Lines will be displayed in pairs on screen — consider how consecutive lines read together
+- For verse or poetry, treat each line break as a natural split point"""
+
+def get_supabase():
     try:
-        correct = st.secrets["APP_PASSWORD"]
+        url = st.secrets["supabase"]["url"]
+        key = st.secrets["supabase"]["key"]
+        return create_client(url, key)
     except Exception:
-        st.error("APP_PASSWORD not set in Streamlit secrets.")
-        st.stop()
+        return None
 
-    st.title("🎭 Caption Splitter")
-    entered = st.text_input("Password", type="password")
-    if st.button("Enter"):
-        if entered == correct:
-            st.session_state["authenticated"] = True
-            st.rerun()
-        else:
-            st.error("Incorrect password.")
-    st.stop()
+@st.cache_data(ttl=60)
+def load_rules() -> str:
+    sb = get_supabase()
+    if sb:
+        try:
+            result = sb.table("rules").select("content").eq("id", 1).execute()
+            if result.data and result.data[0]["content"]:
+                return result.data[0]["content"]
+        except Exception:
+            pass
+    if RULES_FILE.exists():
+        return RULES_FILE.read_text(encoding="utf-8")
+    return DEFAULT_RULES
 
-check_password()
+def save_rules(text: str):
+    sb = get_supabase()
+    if sb:
+        sb.table("rules").upsert({"id": 1, "content": text}).execute()
+        st.cache_data.clear()
+    else:
+        RULES_FILE.write_text(text, encoding="utf-8")
 
 # ── API key ───────────────────────────────────────────────────────────────────
 
@@ -85,168 +112,78 @@ with st.sidebar:
 
     st.markdown("---")
 
-    custom_rules = st.text_area(
-        "Additional rules for Claude",
-        placeholder=(
-            "One rule per line, in plain English. For example:\n"
-            "- Never split a character's name from their title\n"
-            "- Keep 'ladies and gentlemen' on one line\n"
-            "- Treat ellipses as sentence endings"
-        ),
-        height=140,
-        help=(
-            "These are appended directly to Claude's instructions. "
-            "Write them as you would explain them to a person."
-        ),
-    )
+    with st.expander("Edit caption rules"):
+        st.caption(
+            "These rules are sent to Claude verbatim. "
+            "Use `{max_chars}` anywhere to insert the character target. "
+            "Changes are saved to Supabase."
+        )
+        edited_rules = st.text_area(
+            "Rules",
+            value=load_rules(),
+            height=260,
+            label_visibility="collapsed",
+            key="rules_editor",
+        )
+        col1, col2 = st.columns(2)
+        if col1.button("Save rules", use_container_width=True):
+            save_rules(edited_rules)
+            st.success("Saved.")
+        if col2.button("Reset to defaults", use_container_width=True):
+            save_rules(DEFAULT_RULES)
+            st.rerun()
 
     st.markdown("---")
     st.caption(
-        "A typical script scene costs less than 1p to process. "
-        "No data is sent anywhere except the Anthropic API."
+        "Splitting is done entirely by Claude — no data is sent anywhere else. "
+        "A typical script scene costs less than 1p to process."
     )
 
 # ── Prompt builder ────────────────────────────────────────────────────────────
 
-def build_prompt(
-    text: str,
-    remove_dirs: bool,
-    char_mode: str,
-    max_chars: int,
-    custom_rules: str,
-) -> str:
-
-    short_first_line = max_chars - 12  # approx: target minus avg name length + space
-
+def build_prompt(text: str, remove_dirs: bool, char_mode: str, max_chars: int) -> str:
     char_instructions = {
         "remove": (
-            "Do not include character name labels in the output at all. "
-            "Omit them entirely."
+            "Remove character name labels entirely — do not include them in the output at all."
         ),
         "keep_caps": (
             "Keep character names in ALL CAPS as they appear, followed by a colon "
-            "(e.g. HAMLET:). Tag these as type 'character'."
+            "(e.g. HAMLET:). Place each name as its own entry in the array."
         ),
         "title": (
             "Convert character names to Title Case followed by a colon "
-            "(e.g. HAMLET → Hamlet:). Tag these as type 'character'."
+            "(e.g. HAMLET → Hamlet:). Place each name as its own entry in the array."
         ),
     }
 
     dir_instruction = (
-        "Remove all stage directions. This includes text in ( ) or [ ], and any "
-        "lines that are clearly performance instructions rather than dialogue — "
-        "even if unbracketed. Use your judgement."
+        "Remove all stage directions from the output. This includes text in parentheses "
+        "or square brackets, and any lines that are clearly performance instructions "
+        "rather than speech — even if they are not bracketed. Use your judgement: if a "
+        "line is clearly telling a performer what to do rather than being dialogue, remove it."
         if remove_dirs else
-        "Keep stage directions in the output. Tag them as type 'direction'."
+        "Keep stage directions in the output, treating them as normal text to be split."
     )
 
-    custom_block = ""
-    if custom_rules and custom_rules.strip():
-        rules_list = "\n".join(
-            f"- {r.lstrip('-• ').strip()}"
-            for r in custom_rules.strip().splitlines()
-            if r.strip()
-        )
-        custom_block = f"\nADDITIONAL RULES (apply these carefully):\n{rules_list}\n"
+    active_rules = load_rules().replace("{max_chars}", str(max_chars))
 
     return f"""You are an expert caption editor for live theatre and performance. \
 Take the script text below and split it into individual caption lines ready for display on screen.
 
 CAPTION LINE RULES:
-- Target approximately {max_chars} characters per line — treat this as a soft guide, not a hard limit
-- Prioritise meaning and natural speech rhythm over hitting the character count exactly
-- Never break mid-phrase or mid-thought
-- Prefer splitting in this order of priority:
-    1. After sentence-ending punctuation (. ! ?)
-    2. After a comma, semicolon, colon, or dash
-    3. Before a coordinating conjunction (and, but, or, nor, yet, so)
-    4. Before a subordinating clause (because, when, while, although, if, that, which, who)
-    5. Between natural phrases or breath points
-- Keep subjects with their verbs where possible
-- Lines will be displayed in pairs on screen — consider how consecutive lines read together
-- For verse or poetry, treat each line break as a natural split point
-- IMPORTANT: Character names are displayed on the same line as the actor's first words. The name and first line of dialogue will be combined, so the first line of dialogue after any character name must be short enough that name + space + first line totals approximately {max_chars} characters. For example, if the name is "HAMLET:" (7 chars) and the target is {max_chars} chars, the first dialogue line should be no more than {short_first_line} characters.
-{custom_block}
+{active_rules}
+
 FORMATTING:
 - {dir_instruction}
 - {char_instructions[char_mode]}
 
-OUTPUT FORMAT:
-Return ONLY a raw JSON array of objects. Each object must have exactly two fields:
-  "type": one of "character", "line", or "direction"
-  "text": the caption text
-
-No explanation, no markdown, no code fences — just the raw JSON array.
-
-Example:
-[
-  {{"type": "character", "text": "Hamlet:"}},
-  {{"type": "line", "text": "To be, or not to be,"}},
-  {{"type": "line", "text": "that is the question:"}}
-]
+OUTPUT:
+Return ONLY a raw JSON array of strings. No explanation, no markdown, no code fences — \
+just the JSON array starting with [ and ending with ]. Example:
+["To be, or not to be,", "that is the question:"]
 
 SCRIPT:
 {text}"""
-
-# ── Pairing logic ─────────────────────────────────────────────────────────────
-
-def pair_into_frames(items: list[dict]) -> list[dict]:
-    """
-    Pairs items into two-column caption frames, applying layout rules:
-
-    RULE 1: Character names always go in Line 1 (left column).
-    RULE 2: Line 2 of a character-name frame is the first line of their dialogue
-            — the name and their opening words share a frame.
-    RULE 3: If a regular line would pair with a character name in L2,
-            L2 is left blank instead, and the name starts the next frame.
-    """
-    frames = []
-    i = 0
-
-    while i < len(items):
-        item = items[i]
-
-        if item["type"] == "character":
-            # L1 = character name + their first line of dialogue on the same line
-            # L2 = second line of their dialogue (or blank)
-            name = item["text"]
-            l1 = name
-            l2 = ""
-            i += 1
-
-            if i < len(items) and items[i]["type"] != "character":
-                l1 = name + " " + items[i]["text"]   # combine name and first speech
-                i += 1
-                if i < len(items) and items[i]["type"] != "character":
-                    l2 = items[i]["text"]
-                    i += 1
-
-            frames.append({
-                "#":               len(frames) + 1,
-                "Line 1 (top)":    l1,
-                "Line 2 (bottom)": l2,
-                "_type":           "character",
-            })
-
-        else:
-            # L1 = this line
-            # L2 = next line, but ONLY if next item is not a character name
-            # (if it is, leave L2 blank so the name opens its own frame in L1)
-            l1 = item["text"]
-            l2 = ""
-            i += 1
-            if i < len(items) and items[i]["type"] != "character":
-                l2 = items[i]["text"]
-                i += 1
-            frames.append({
-                "#":               len(frames) + 1,
-                "Line 1 (top)":    l1,
-                "Line 2 (bottom)": l2,
-                "_type":           "line",
-            })
-
-    return frames
 
 # ── Main UI ───────────────────────────────────────────────────────────────────
 
@@ -281,39 +218,30 @@ if not api_key:
 # ── Generation ────────────────────────────────────────────────────────────────
 
 if generate and ready:
-    prompt = build_prompt(
-        script_input, remove_dirs, char_mode, max_chars, custom_rules
-    )
+    prompt = build_prompt(script_input, remove_dirs, char_mode, max_chars)
 
     with st.spinner("Claude is reading your script…"):
         try:
             client = anthropic.Anthropic(api_key=api_key)
             message = client.messages.create(
-                model="claude-sonnet-4-6",
+                model="claude-sonnet-4-20250514",
                 max_tokens=4096,
                 messages=[{"role": "user", "content": prompt}],
             )
             raw = message.content[0].text.strip()
 
-            # Strip any accidental markdown fences
             if raw.startswith("```"):
                 raw = raw.split("```")[1]
                 if raw.startswith("json"):
                     raw = raw[4:]
             raw = raw.strip()
 
-            parsed = json.loads(raw)
+            lines = json.loads(raw)
 
-            if not isinstance(parsed, list):
+            if not isinstance(lines, list):
                 raise ValueError("Response was not a JSON array.")
 
-            # Validate and clean each item
-            items = []
-            for obj in parsed:
-                t = obj.get("type", "line")
-                text = str(obj.get("text", "")).strip()
-                if text:
-                    items.append({"type": t, "text": text})
+            lines = [str(l).strip() for l in lines if str(l).strip()]
 
         except anthropic.AuthenticationError:
             st.error("Invalid API key — please check it in the sidebar.")
@@ -330,14 +258,19 @@ if generate and ready:
             st.error(f"Something went wrong: {e}")
             st.stop()
 
-    frames = pair_into_frames(items)
-    df = pd.DataFrame(frames).drop(columns=["_type"])
+    frames = []
+    for i in range(0, len(lines), 2):
+        frames.append({
+            "#":               i // 2 + 1,
+            "Line 1 (top)":    lines[i],
+            "Line 2 (bottom)": lines[i + 1] if i + 1 < len(lines) else "",
+        })
 
-    line_count = len(items)
-    avg = sum(len(it["text"]) for it in items) // max(line_count, 1)
+    df = pd.DataFrame(frames)
 
     st.success(
-        f"{len(frames)} caption frames · {line_count} lines · ≈{avg} chars avg"
+        f"{len(frames)} caption frames · {len(lines)} lines · "
+        f"≈{sum(len(l) for l in lines) // len(lines)} chars avg"
     )
 
     st.dataframe(
