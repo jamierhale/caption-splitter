@@ -228,7 +228,7 @@ if generate and ready:
         try:
             client = anthropic.Anthropic(api_key=api_key)
             message = client.messages.create(
-               model="claude-sonnet-4-5",,
+               model="claude-sonnet-4-5",
                 max_tokens=4096,
                 messages=[{"role": "user", "content": prompt}],
             )
