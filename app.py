@@ -38,7 +38,7 @@ def load_rules() -> str:
     sb = get_supabase()
     if sb:
         try:
-            result = sb.table("rules").select("content").eq("id", 1).execute()
+            result = sb.table("caption_rules").select("content").eq("id", 1).execute()
             if result.data and result.data[0]["content"]:
                 return result.data[0]["content"]
         except Exception:
@@ -51,13 +51,14 @@ def save_rules(text: str):
     sb = get_supabase()
     if sb:
         try:
-            sb.table("rules").update({"content": text}).eq("id", 1).execute()
+            sb.table("caption_rules").update({"content": text}).eq("id", 1).execute()
             st.cache_data.clear()
         except Exception as e:
             st.error(f"Supabase error: {type(e).__name__}: {str(e)}")
             st.stop()
     else:
         RULES_FILE.write_text(text, encoding="utf-8")
+
 # ── API key ───────────────────────────────────────────────────────────────────
 
 def get_api_key():
