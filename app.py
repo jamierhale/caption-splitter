@@ -50,10 +50,8 @@ def load_rules() -> str:
 def save_rules(text: str):
     sb = get_supabase()
     if sb:
-        sb.table("rules").update({"content": text}).eq("id", 1).execute()
-        st.cache_data.clear()
         try:
-            result = sb.table("rules").update({"content": text}).eq("id", 1).execute()
+            sb.table("rules").update({"content": text}).eq("id", 1).execute()
             st.cache_data.clear()
         except Exception as e:
             st.error(f"Supabase error: {type(e).__name__}: {str(e)}")
