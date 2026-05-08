@@ -56,8 +56,8 @@ def save_rules(text: str):
             result = sb.table("rules").update({"content": text}).eq("id", 1).execute()
             st.cache_data.clear()
         except Exception as e:
-            st.error(f"Supabase error: {e}")
-            raise
+            st.error(f"Supabase error: {type(e).__name__}: {str(e)}")
+            st.stop()
     else:
         RULES_FILE.write_text(text, encoding="utf-8")
 # ── API key ───────────────────────────────────────────────────────────────────
