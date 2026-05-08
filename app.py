@@ -50,7 +50,7 @@ def load_rules() -> str:
 def save_rules(text: str):
     sb = get_supabase()
     if sb:
-        sb.table("rules").upsert({"id": 1, "content": text}).execute()
+        sb.table("rules").update({"content": text}).eq("id", 1).execute()
         st.cache_data.clear()
     else:
         RULES_FILE.write_text(text, encoding="utf-8")
